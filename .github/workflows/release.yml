@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64 package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Bundle Pdfium
+        shell: pwsh
+        run: |
+          curl.exe -fsSL -o pdfium.tgz https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz
+          tar -xzf pdfium.tgz
+          $dll = Get-ChildItem -Recurse -Filter pdfium.dll | Select-Object -First 1
+          if (-not $dll) { throw "pdfium.dll was not in the pdfium-binaries archive" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/openimp.exe dist/openimp.exe
+          Copy-Item $dll.FullName dist/pdfium.dll
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.release.tag_name }}"
+          $safe = $tag -replace '[^\w\.\-]', '-'
+          $zip = "openimp-$safe-windows-x64.zip"
+          Compress-Archive -Path dist/openimp.exe, dist/pdfium.dll -DestinationPath $zip
+          "ASSET=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: gh release upload "${{ github.event.release.tag_name }}" --clobber $env:ASSET
