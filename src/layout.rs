@@ -411,7 +411,10 @@ fn place_side(
     if per_sheet == 0 {
         return Vec::new();
     }
-    let pages: Vec<usize> = pairs.iter().flat_map(|(left, right)| [*left, *right]).collect();
+    let pages: Vec<usize> = pairs
+        .iter()
+        .flat_map(|(left, right)| [*left, *right])
+        .collect();
     let mut cells = Vec::new();
     for chunk in pages.chunks(per_sheet) {
         for page in chunk {
@@ -615,12 +618,7 @@ fn crop_marks_for_cell(cell: Rect, spec: &SheetSpec) -> Vec<Segment> {
         (x0, y0 - bottom - offset - length, x0, y0 - bottom - offset),
         // Bottom right.
         (x1 + right + offset, y0, x1 + right + offset + length, y0),
-        (
-            x1,
-            y0 - bottom - offset - length,
-            x1,
-            y0 - bottom - offset,
-        ),
+        (x1, y0 - bottom - offset - length, x1, y0 - bottom - offset),
         // Top left.
         (x0 - left - offset - length, y1, x0 - left - offset, y1),
         (x0, y1 + top + offset, x0, y1 + top + offset + length),
@@ -815,11 +813,7 @@ mod tests {
             fit: FitMode::Contain,
             signature_pages: 0,
         };
-        let sheets = impose(
-            &[SourceSize::page(100.0, 100.0)],
-            &spec,
-        )
-        .unwrap();
+        let sheets = impose(&[SourceSize::page(100.0, 100.0)], &spec).unwrap();
         let cell = sheets[0].cells[0];
         let marks = &sheets[0].crop_marks;
         assert_eq!(marks.len(), 8);
@@ -865,11 +859,7 @@ mod tests {
             fit: FitMode::Contain,
             signature_pages: 0,
         };
-        let sheets = impose(
-            &[SourceSize::page(10.0, 10.0)],
-            &spec,
-        )
-        .unwrap();
+        let sheets = impose(&[SourceSize::page(10.0, 10.0)], &spec).unwrap();
         assert!(!sheets[0].crop_marks.is_empty());
         for mark in &sheets[0].crop_marks {
             for value in [mark.x1, mark.x2] {
@@ -903,11 +893,7 @@ mod tests {
             fit: FitMode::Contain,
             signature_pages: 0,
         };
-        let sheets = impose(
-            &[SourceSize::page(100.0, 100.0)],
-            &spec,
-        )
-        .unwrap();
+        let sheets = impose(&[SourceSize::page(100.0, 100.0)], &spec).unwrap();
         let cell = sheets[0].cells[0];
         let placement = &sheets[0].placements[0];
         assert_close(placement.clip.x, cell.x - bleed);
@@ -1021,7 +1007,10 @@ mod tests {
     #[test]
     fn eight_page_signature_orders_fronts_then_backs() {
         let slots = signature_slots(8, 2, 2, 8);
-        let pages: Vec<Option<usize>> = slots.iter().map(|slot| slot.map(|index| index + 1)).collect();
+        let pages: Vec<Option<usize>> = slots
+            .iter()
+            .map(|slot| slot.map(|index| index + 1))
+            .collect();
         assert_eq!(
             pages,
             vec![
@@ -1037,14 +1026,29 @@ mod tests {
         );
 
         let wide = signature_slots(8, 4, 1, 8);
-        let wide_pages: Vec<Option<usize>> = wide.iter().map(|slot| slot.map(|index| index + 1)).collect();
+        let wide_pages: Vec<Option<usize>> = wide
+            .iter()
+            .map(|slot| slot.map(|index| index + 1))
+            .collect();
         assert_eq!(
             wide_pages,
-            vec![Some(8), Some(1), Some(6), Some(3), Some(2), Some(7), Some(4), Some(5)]
+            vec![
+                Some(8),
+                Some(1),
+                Some(6),
+                Some(3),
+                Some(2),
+                Some(7),
+                Some(4),
+                Some(5)
+            ]
         );
 
         let grid = signature_slots(8, 4, 4, 8);
-        let first_row: Vec<Option<usize>> = grid[..4].iter().map(|slot| slot.map(|index| index + 1)).collect();
+        let first_row: Vec<Option<usize>> = grid[..4]
+            .iter()
+            .map(|slot| slot.map(|index| index + 1))
+            .collect();
         assert_eq!(first_row, vec![Some(8), Some(1), Some(6), Some(3)]);
         assert!(grid[4..16].iter().all(|slot| slot.is_none()));
         let second_row: Vec<Option<usize>> = grid[16..20]
@@ -1085,7 +1089,10 @@ mod tests {
         assert!(spacing_is_tight(&spec, &[]));
         assert!(spacing_is_tight(
             &spec,
-            &[SourceSize::page(100.0, 100.0), SourceSize::page(100.0, 100.0)]
+            &[
+                SourceSize::page(100.0, 100.0),
+                SourceSize::page(100.0, 100.0)
+            ]
         ));
         let small = SourceSize::page(100.0, 100.0).with_target(40.0, 40.0);
         assert!(!spacing_is_tight(&spec, &[small, small]));

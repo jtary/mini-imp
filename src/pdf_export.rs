@@ -148,13 +148,8 @@ pub fn export_pdf(
 }
 
 enum Prepared {
-    Pdf {
-        path: PathBuf,
-        page_index: usize,
-    },
-    Image {
-        path: PathBuf,
-    },
+    Pdf { path: PathBuf, page_index: usize },
+    Image { path: PathBuf },
 }
 
 struct ImportedPage {
@@ -194,8 +189,7 @@ fn load_source(path: &Path) -> Result<Document, String> {
 fn page_geometry(doc: &Document, page_id: ObjectId) -> Result<PageGeometry, String> {
     let (llx, lly, urx, ury) = page_box(doc, page_id)?;
     let rotate = inherited_number(doc, page_id, b"Rotate").unwrap_or(0.0) as i64;
-    let (width, height) =
-        layout::visual_page_size((urx - llx).abs(), (ury - lly).abs(), rotate);
+    let (width, height) = layout::visual_page_size((urx - llx).abs(), (ury - lly).abs(), rotate);
     if width <= 0.0 || height <= 0.0 {
         return Err("A PDF page has no printable size.".into());
     }
@@ -382,14 +376,7 @@ fn build_sheet_page(
                     .flatten()
                     .ok_or_else(|| "Missing an embedded image.".to_string())?;
                 xobjects.set(name.clone(), image_id);
-                push_placement(
-                    &mut operations,
-                    &name,
-                    placement,
-                    1.0,
-                    1.0,
-                    false,
-                );
+                push_placement(&mut operations, &name, placement, 1.0, 1.0, false);
             }
         }
     }

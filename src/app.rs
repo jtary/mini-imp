@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use egui::{
-    Align2, Color32, ColorImage, ComboBox, Context, DragValue, FontId, Id, LayerId,
-    Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
-    pos2,
+    Align2, Color32, ColorImage, ComboBox, Context, DragValue, FontId, Frame, Id, Image, LayerId,
+    Margin, Order, Pos2, Rect, RichText, ScrollArea, Sense, Shadow, Stroke, StrokeKind,
+    TextureHandle, TextureOptions, Vec2, pos2, vec2,
 };
+
+use crate::theme::{self, Fluent, Icon};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, WindowFromPoint};
@@ -102,7 +104,8 @@ pub struct OpenImpApp {
 }
 
 impl OpenImpApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        theme::apply(&cc.egui_ctx);
         let (thumb_tx, thumb_rx) = sources::spawn_thumbnail_worker();
         let margin = MARGIN_MM * layout::PT_PER_MM;
         let gutter = GUTTER_MM * layout::PT_PER_MM;
@@ -369,94 +372,237 @@ impl eframe::App for OpenImpApp {
             self.sheet_index = sheet_count - 1;
         }
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("OpenImp");
-                ui.separator();
-                if ui.button("Add files").clicked() {
-                    self.add_files();
+        self.command_bar(ui);
+        self.notice_bar(ui);
+
+        let sources_rect = self.sources_panel(ui, cell_size);
+        self.accept_dropped_files(&ctx, sources_rect);
+
+        egui::Panel::right("inspector")
+            .resizable(true)
+            .default_size(300.0)
+            .min_size(260.0)
+            .frame(theme::panel_frame(ui))
+            .show(ui, |ui| {
+                ui.label(RichText::new("Settings").strong().size(18.0));
+                ui.add_space(8.0);
+                ScrollArea::vertical().show(ui, |ui| {
+                    self.settings_ui(ui, &spec, &sizes);
+                });
+            });
+
+        egui::CentralPanel::default()
+            .frame(theme::canvas_frame(ui))
+            .show(ui, |ui| match &layout {
+                Ok(sheets) => {
+                    let fluent = Fluent::from_visuals(ui.visuals());
+                    ui.horizontal(|ui| {
+                        if theme::icon_button(
+                            ui,
+                            Icon::ChevronLeft,
+                            "Previous",
+                            self.sheet_index > 0,
+                        )
+                        .clicked()
+                        {
+                            self.sheet_index -= 1;
+                        }
+                        ui.label(format!(
+                            "Sheet {} of {}",
+                            self.sheet_index + 1,
+                            sheets.len().max(1)
+                        ));
+                        if theme::icon_button(
+                            ui,
+                            Icon::ChevronRight,
+                            "Next",
+                            self.sheet_index + 1 < sheets.len(),
+                        )
+                        .clicked()
+                        {
+                            self.sheet_index += 1;
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "{} × {} pt",
+                                spec.width_pt.round(),
+                                spec.height_pt.round()
+                            ))
+                            .color(fluent.text_secondary),
+                        );
+                    });
+                    if self.slots.is_empty() {
+                        ui.label(
+                            RichText::new(
+                                "Add PDFs or images. The grid shows where they will land.",
+                            )
+                            .color(fluent.text_secondary),
+                        );
+                    }
+                    paint_sheet(
+                        ui,
+                        &spec,
+                        &sheets[self.sheet_index],
+                        &self.slots,
+                        &slot_indices,
+                    );
                 }
-                let has_sources = !self.slots.is_empty();
-                if ui
-                    .add_enabled(has_sources, egui::Button::new("Export PDF"))
-                    .clicked()
-                {
-                    self.export_pdf();
+                Err(error) => {
+                    ui.colored_label(Fluent::from_visuals(ui.visuals()).error_fg, error);
                 }
-                let print = ui
-                    .add_enabled(
+            });
+    }
+}
+
+enum ListAction {
+    Up(usize),
+    Down(usize),
+    Remove(usize),
+}
+
+impl OpenImpApp {
+    fn command_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("command")
+            .show_separator_line(false)
+            .frame(theme::panel_frame(ui))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui, Icon::Add, "Add files").clicked() {
+                        self.add_files();
+                    }
+                    let has_sources = !self.slots.is_empty();
+                    if theme::quiet_button(ui, Icon::Save, "Export PDF", has_sources).clicked() {
+                        self.export_pdf();
+                    }
+                    let print = theme::quiet_button(
+                        ui,
+                        Icon::Print,
+                        "Print",
                         has_sources && matches!(self.pdfium, PdfiumState::Ready),
-                        egui::Button::new("Print"),
                     )
                     .on_disabled_hover_text(match self.pdfium {
                         PdfiumState::Missing => "Place pdfium.dll next to OpenImp.exe to print.",
                         PdfiumState::Checking => "Checking for pdfium.dll…",
                         PdfiumState::Ready => "Add a PDF or an image first.",
                     });
-                if print.clicked() {
-                    self.print();
-                }
-                if matches!(self.pdfium, PdfiumState::Missing) {
-                    ui.label(
-                        RichText::new("pdfium.dll not found — PDF previews and printing are off.")
-                            .color(Color32::from_rgb(180, 120, 40)),
+                    if print.clicked() {
+                        self.print();
+                    }
+                });
+            });
+    }
+
+    fn notice_bar(&mut self, ui: &mut egui::Ui) {
+        let pdfium_missing = matches!(self.pdfium, PdfiumState::Missing);
+        let notice = match &self.notice {
+            Notice::None => None,
+            Notice::Info(text) => Some((text.clone(), BannerKind::Info)),
+            Notice::Error(text) => Some((text.clone(), BannerKind::Error)),
+        };
+        if !pdfium_missing && notice.is_none() {
+            return;
+        }
+        egui::Panel::top("notices")
+            .show_separator_line(false)
+            .frame(theme::panel_frame(ui))
+            .show(ui, |ui| {
+                if pdfium_missing {
+                    banner(
+                        ui,
+                        BannerKind::Warning,
+                        "pdfium.dll not found — PDF previews and printing are off.",
                     );
                 }
+                if let Some((text, kind)) = notice {
+                    if pdfium_missing {
+                        ui.add_space(6.0);
+                    }
+                    banner(ui, kind, &text);
+                }
             });
-            if let Some((text, color)) = match &self.notice {
-                Notice::None => None,
-                Notice::Info(text) => Some((text.as_str(), Color32::GRAY)),
-                Notice::Error(text) => Some((text.as_str(), Color32::from_rgb(200, 80, 70))),
-            } {
-                ui.label(RichText::new(text).color(color));
-            }
-            ui.add_space(4.0);
-        });
+    }
 
-        egui::Panel::bottom("settings").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.settings_ui(ui, &spec, &sizes);
-            ui.add_space(4.0);
-        });
-
-        let sources_panel = egui::Panel::left("sources")
+    fn sources_panel(&mut self, ui: &mut egui::Ui, cell_size: Option<(f64, f64)>) -> Rect {
+        egui::Panel::left("sources")
             .resizable(true)
-            .default_size(300.0)
+            .default_size(340.0)
+            .min_size(280.0)
+            .frame(theme::panel_frame(ui))
             .show(ui, |ui| {
-                ui.heading(format!("Sources ({})", self.slots.len()));
-                ui.label(if self.signature_pages >= 4 && self.columns >= 2 {
-                    "Drop PDFs or images here. Signature order runs left to right, then down the sheet."
-                } else {
-                    "Drop PDFs or images here. Pages run left to right, then down the sheet."
+                let fluent = Fluent::from_visuals(ui.visuals());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Sources").strong().size(18.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(self.slots.len().to_string())
+                                .color(fluent.text_secondary),
+                        );
+                    });
                 });
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut action = None;
-                    let slot_count = self.slots.len();
-                    let unit = self.unit;
-                    for (index, slot) in self.slots.iter_mut().enumerate() {
+                ui.label(
+                    RichText::new(if self.signature_pages >= 4 && self.columns >= 2 {
+                        "Signature order runs left to right, then down the sheet."
+                    } else {
+                        "Pages run left to right, then down the sheet."
+                    })
+                    .color(fluent.text_secondary)
+                    .size(12.0),
+                );
+                ui.add_space(8.0);
+                if self.slots.is_empty() {
+                    let mut add = false;
+                    empty_sources(ui, &mut add);
+                    if add {
+                        self.add_files();
+                    }
+                } else {
+                    ScrollArea::vertical().show(ui, |ui| {
+                        self.source_cards(ui, cell_size);
+                    });
+                }
+            })
+            .response
+            .rect
+    }
+
+    fn source_cards(&mut self, ui: &mut egui::Ui, cell_size: Option<(f64, f64)>) {
+        let mut action = None;
+        let slot_count = self.slots.len();
+        let unit = self.unit;
+        let fluent = Fluent::from_visuals(ui.visuals());
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            card(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    source_thumb(ui, slot);
+                    ui.add_space(10.0);
+                    ui.vertical(|ui| {
+                        ui.set_min_width(ui.available_width());
+                        ui.label(RichText::new(&slot.label).strong());
                         ui.horizontal_wrapped(|ui| {
-                            if ui.add_enabled(index > 0, egui::Button::new("Up")).clicked() {
+                            ui.label(RichText::new("Instances").color(fluent.text_secondary));
+                            ui.add(DragValue::new(&mut slot.copies).range(1..=999).speed(0.1));
+                            if theme::icon_button(ui, Icon::ChevronUp, "Move up", index > 0)
+                                .clicked()
+                            {
                                 action = Some(ListAction::Up(index));
                             }
-                            if ui
-                                .add_enabled(index + 1 < slot_count, egui::Button::new("Down"))
-                                .clicked()
+                            if theme::icon_button(
+                                ui,
+                                Icon::ChevronDown,
+                                "Move down",
+                                index + 1 < slot_count,
+                            )
+                            .clicked()
                             {
                                 action = Some(ListAction::Down(index));
                             }
-                            if ui.button("Remove").clicked() {
+                            if theme::icon_button(ui, Icon::Delete, "Remove", true).clicked() {
                                 action = Some(ListAction::Remove(index));
                             }
-                            ui.label("Instances");
-                            ui.add(DragValue::new(&mut slot.copies).range(1..=999).speed(0.1));
                         });
-                        ui.label(&slot.label);
                         let turned_on = ui.checkbox(&mut slot.use_target, "Target size").changed()
                             && slot.use_target;
-                        if turned_on
-                            && slot.target_width_pt <= 1.0
-                            && slot.target_height_pt <= 1.0
+                        if turned_on && slot.target_width_pt <= 1.0 && slot.target_height_pt <= 1.0
                         {
                             if let Some((width, height)) = cell_size {
                                 slot.target_width_pt = width;
@@ -464,10 +610,8 @@ impl eframe::App for OpenImpApp {
                             }
                         }
                         if slot.use_target {
-                            ui.horizontal_wrapped(|ui| {
-                                drag_points(ui, unit, "Width", &mut slot.target_width_pt);
-                                drag_points(ui, unit, "Height", &mut slot.target_height_pt);
-                            });
+                            drag_points(ui, unit, "Width", &mut slot.target_width_pt);
+                            drag_points(ui, unit, "Height", &mut slot.target_height_pt);
                             if let Some((cell_w, cell_h)) = cell_size {
                                 if !layout::target_fits_cell(
                                     cell_w,
@@ -483,42 +627,43 @@ impl eframe::App for OpenImpApp {
                                             cell_w,
                                             cell_h,
                                         ))
-                                        .color(Color32::from_rgb(180, 120, 40)),
+                                        .color(fluent.warning_fg)
+                                        .size(12.0),
                                     );
                                 }
                             }
                         }
-                        ui.separator();
-                    }
-                    if let Some(action) = action {
-                        match action {
-                            ListAction::Up(index) => self.slots.swap(index, index - 1),
-                            ListAction::Down(index) => self.slots.swap(index, index + 1),
-                            ListAction::Remove(index) => {
-                                self.slots.remove(index);
-                            }
-                        }
-                    }
+                    });
                 });
             });
-        let sources_rect = sources_panel.response.rect;
+            ui.add_space(8.0);
+        }
+        if let Some(action) = action {
+            match action {
+                ListAction::Up(index) => self.slots.swap(index, index - 1),
+                ListAction::Down(index) => self.slots.swap(index, index + 1),
+                ListAction::Remove(index) => {
+                    self.slots.remove(index);
+                }
+            }
+        }
+    }
+
+    fn accept_dropped_files(&mut self, ctx: &Context, sources_rect: Rect) {
         let file_drag = ctx.input(|input| !input.raw.hovered_files.is_empty());
-        let pointer = cursor_in_ui(&ctx);
+        let pointer = cursor_in_ui(ctx);
         let over_sources = pointer_hits_rect(pointer, sources_rect);
         if file_drag {
             ctx.request_repaint();
             if over_sources {
+                let fluent = Fluent::from_visuals(&ctx.global_style().visuals);
                 let painter =
                     ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("source-drop")));
-                painter.rect_filled(
-                    sources_rect,
-                    0.0,
-                    Color32::from_rgba_unmultiplied(90, 150, 220, 48),
-                );
+                painter.rect_filled(sources_rect, 0.0, fluent.accent.gamma_multiply(0.16));
                 painter.rect_stroke(
                     sources_rect,
                     0.0,
-                    Stroke::new(2.0, Color32::from_rgb(120, 170, 230)),
+                    Stroke::new(2.0, fluent.accent),
                     StrokeKind::Inside,
                 );
                 painter.text(
@@ -526,7 +671,7 @@ impl eframe::App for OpenImpApp {
                     Align2::CENTER_CENTER,
                     "Drop to add",
                     FontId::proportional(16.0),
-                    Color32::WHITE,
+                    fluent.text,
                 );
             }
         }
@@ -545,151 +690,105 @@ impl eframe::App for OpenImpApp {
                 }
             }
         }
-
-        egui::CentralPanel::default().show(ui, |ui| match &layout {
-            Ok(sheets) => {
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(self.sheet_index > 0, egui::Button::new("Previous"))
-                        .clicked()
-                    {
-                        self.sheet_index -= 1;
-                    }
-                    ui.label(format!(
-                        "Sheet {} of {}",
-                        self.sheet_index + 1,
-                        sheets.len().max(1)
-                    ));
-                    if ui
-                        .add_enabled(
-                            self.sheet_index + 1 < sheets.len(),
-                            egui::Button::new("Next"),
-                        )
-                        .clicked()
-                    {
-                        self.sheet_index += 1;
-                    }
-                    ui.label(format!(
-                        "{} × {} pt",
-                        spec.width_pt.round(),
-                        spec.height_pt.round()
-                    ));
-                });
-                if self.slots.is_empty() {
-                    ui.label("Add PDFs or images. The grid shows where they will land.");
-                }
-                paint_sheet(
-                    ui,
-                    &spec,
-                    &sheets[self.sheet_index],
-                    &self.slots,
-                    &slot_indices,
-                );
-            }
-            Err(error) => {
-                ui.colored_label(Color32::from_rgb(200, 80, 70), error);
-            }
-        });
     }
-}
 
-enum ListAction {
-    Up(usize),
-    Down(usize),
-    Remove(usize),
-}
-
-impl OpenImpApp {
     fn settings_ui(&mut self, ui: &mut egui::Ui, spec: &SheetSpec, sources: &[SourceSize]) {
-        ui.horizontal_wrapped(|ui| {
-            ComboBox::from_label("Sheet")
-                .selected_text(self.preset.label())
-                .show_ui(ui, |ui| {
-                    for preset in SheetPreset::ALL {
-                        ui.selectable_value(&mut self.preset, preset, preset.label());
-                    }
-                });
-            ComboBox::from_label("Orientation")
-                .selected_text(match self.orientation {
-                    Orientation::Portrait => "Portrait",
-                    Orientation::Landscape => "Landscape",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.orientation, Orientation::Portrait, "Portrait");
-                    ui.selectable_value(&mut self.orientation, Orientation::Landscape, "Landscape");
-                });
-            ComboBox::from_label("Units")
-                .selected_text(match self.unit {
-                    DisplayUnit::Millimetres => "Millimetres",
-                    DisplayUnit::Inches => "Inches",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.unit, DisplayUnit::Millimetres, "Millimetres");
-                    ui.selectable_value(&mut self.unit, DisplayUnit::Inches, "Inches");
-                });
-            ComboBox::from_label("Fit")
-                .selected_text(self.fit.label())
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.fit, FitMode::Contain, FitMode::Contain.label());
-                    ui.selectable_value(&mut self.fit, FitMode::Fill, FitMode::Fill.label());
-                });
-            ui.checkbox(&mut self.crop_marks, "Crop marks");
-        });
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Columns");
-            ui.add(DragValue::new(&mut self.columns).range(1..=32).speed(0.05));
-            ui.label("Rows");
-            ui.add(DragValue::new(&mut self.rows).range(1..=32).speed(0.05));
-            ui.label("Signature");
-            ui.add(
-                DragValue::new(&mut self.signature_pages)
-                    .range(0..=128)
-                    .speed(0.15),
-            )
-            .on_hover_text(
-                "Pages in one folded section. 0 keeps left-to-right order. 8 on a 2×2 sheet is 8, 1, 6, 3 then 2, 7, 4, 5.",
-            );
-            ui.label(format!(
-                "Sheet size: {:.1} × {:.1}{}",
-                self.unit.from_pt(spec.width_pt),
-                self.unit.from_pt(spec.height_pt),
-                self.unit.suffix()
-            ));
-            if let Ok((width, height)) = layout::trim_size(spec) {
-                ui.label(format!(
-                    "Cell size: {:.1} × {:.1}{}",
-                    self.unit.from_pt(width),
-                    self.unit.from_pt(height),
+        let fluent = Fluent::from_visuals(ui.visuals());
+        section(ui, "Sheet", |ui| {
+            combo_row(ui, "sheet", "Sheet", self.preset.label(), |ui| {
+                for preset in SheetPreset::ALL {
+                    ui.selectable_value(&mut self.preset, preset, preset.label());
+                }
+            });
+            let orientation = match self.orientation {
+                Orientation::Portrait => "Portrait",
+                Orientation::Landscape => "Landscape",
+            };
+            combo_row(ui, "orientation", "Orientation", orientation, |ui| {
+                ui.selectable_value(&mut self.orientation, Orientation::Portrait, "Portrait");
+                ui.selectable_value(&mut self.orientation, Orientation::Landscape, "Landscape");
+            });
+            let units = match self.unit {
+                DisplayUnit::Millimetres => "Millimetres",
+                DisplayUnit::Inches => "Inches",
+            };
+            combo_row(ui, "units", "Units", units, |ui| {
+                ui.selectable_value(&mut self.unit, DisplayUnit::Millimetres, "Millimetres");
+                ui.selectable_value(&mut self.unit, DisplayUnit::Inches, "Inches");
+            });
+            ui.label(
+                RichText::new(format!(
+                    "Sheet size: {:.1} × {:.1}{}",
+                    self.unit.from_pt(spec.width_pt),
+                    self.unit.from_pt(spec.height_pt),
                     self.unit.suffix()
                 ))
+                .color(fluent.text_secondary)
+                .size(12.0),
+            );
+            if self.preset == SheetPreset::Custom {
+                ui.add_space(4.0);
+                drag_points(ui, self.unit, "Width", &mut self.custom_width_pt);
+                drag_points(ui, self.unit, "Height", &mut self.custom_height_pt);
+            }
+        });
+
+        section(ui, "Grid", |ui| {
+            number_row(ui, "Columns", &mut self.columns, 1..=32, 0.05);
+            number_row(ui, "Rows", &mut self.rows, 1..=32, 0.05);
+            combo_row(ui, "fit", "Fit", self.fit.label(), |ui| {
+                ui.selectable_value(&mut self.fit, FitMode::Contain, FitMode::Contain.label());
+                ui.selectable_value(&mut self.fit, FitMode::Fill, FitMode::Fill.label());
+            });
+            number_row(ui, "Signature", &mut self.signature_pages, 0..=128, 0.15).on_hover_text(
+                "Pages in one folded section. 0 keeps left-to-right order. 8 on a 2×2 sheet is 8, 1, 6, 3 then 2, 7, 4, 5.",
+            );
+            ui.checkbox(&mut self.crop_marks, "Crop marks");
+            if let Ok((width, height)) = layout::trim_size(spec) {
+                ui.label(
+                    RichText::new(format!(
+                        "Cell size: {:.1} × {:.1}{}",
+                        self.unit.from_pt(width),
+                        self.unit.from_pt(height),
+                        self.unit.suffix()
+                    ))
+                    .color(fluent.text_secondary)
+                    .size(12.0),
+                )
                 .on_hover_text(
                     "Largest trim that fits in the sheet, margins, and gutters. A target size has to fit inside this.",
                 );
             }
+            if self.signature_pages >= 4 && self.columns < 2 {
+                ui.label(
+                    RichText::new("Signature order needs 2 or more columns.")
+                        .color(fluent.warning_fg)
+                        .size(12.0),
+                );
+            } else if self.signature_pages >= 4 && self.signature_pages % 4 != 0 {
+                let padded = self.signature_pages.div_ceil(4) * 4;
+                ui.label(
+                    RichText::new(format!(
+                        "Signature size is padded to {padded} pages, a multiple of 4."
+                    ))
+                    .color(fluent.warning_fg)
+                    .size(12.0),
+                );
+            }
         });
 
-        if self.preset == SheetPreset::Custom {
-            ui.horizontal_wrapped(|ui| {
-                drag_points(ui, self.unit, "Width", &mut self.custom_width_pt);
-                drag_points(ui, self.unit, "Height", &mut self.custom_height_pt);
-            });
-        }
-
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Margins");
+        section(ui, "Spacing", |ui| {
+            ui.label(RichText::new("Margins").color(fluent.text_secondary));
             drag_points(ui, self.unit, "Top", &mut self.margin_top);
             drag_points(ui, self.unit, "Right", &mut self.margin_right);
             drag_points(ui, self.unit, "Bottom", &mut self.margin_bottom);
             drag_points(ui, self.unit, "Left", &mut self.margin_left);
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Gutters");
+            ui.add_space(4.0);
+            ui.label(RichText::new("Gutters").color(fluent.text_secondary));
             drag_points(ui, self.unit, "Horizontal", &mut self.gutter_x);
             drag_points(ui, self.unit, "Vertical", &mut self.gutter_y);
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Bleed");
+            ui.add_space(4.0);
+            ui.label(RichText::new("Bleed").color(fluent.text_secondary));
             if self.bleed_linked {
                 drag_points(ui, self.unit, "All sides", &mut self.bleed_top);
                 let bleed = self.bleed_top;
@@ -698,40 +797,157 @@ impl OpenImpApp {
                 self.bleed_left = bleed;
             }
             ui.checkbox(&mut self.bleed_linked, "Same on all sides");
-        });
-        if !self.bleed_linked {
-            ui.horizontal_wrapped(|ui| {
+            if !self.bleed_linked {
                 drag_points(ui, self.unit, "Top", &mut self.bleed_top);
                 drag_points(ui, self.unit, "Right", &mut self.bleed_right);
                 drag_points(ui, self.unit, "Bottom", &mut self.bleed_bottom);
                 drag_points(ui, self.unit, "Left", &mut self.bleed_left);
-            });
-        }
-
-        if self.signature_pages >= 4 && self.columns < 2 {
-            ui.label(
-                RichText::new("Signature order needs 2 or more columns.")
-                    .color(Color32::from_rgb(180, 120, 40)),
-            );
-        } else if self.signature_pages >= 4 && self.signature_pages % 4 != 0 {
-            let padded = self.signature_pages.div_ceil(4) * 4;
-            ui.label(
-                RichText::new(format!(
-                    "Signature size is padded to {padded} pages, a multiple of 4."
-                ))
-                .color(Color32::from_rgb(180, 120, 40)),
-            );
-        }
-
-        if layout::spacing_is_tight(spec, sources) {
-            ui.label(
-                RichText::new(
-                    "Bleed and crop marks need more margin or gutter, or they will be clipped.",
-                )
-                .color(Color32::from_rgb(180, 120, 40)),
-            );
-        }
+            }
+            if layout::spacing_is_tight(spec, sources) {
+                ui.label(
+                    RichText::new(
+                        "Bleed and crop marks need more margin or gutter, or they will be clipped.",
+                    )
+                    .color(fluent.warning_fg)
+                    .size(12.0),
+                );
+            }
+        });
     }
+}
+
+enum BannerKind {
+    Info,
+    Warning,
+    Error,
+}
+
+fn banner(ui: &mut egui::Ui, kind: BannerKind, text: &str) {
+    let fluent = Fluent::from_visuals(ui.visuals());
+    let (background, foreground, icon) = match kind {
+        BannerKind::Info => (fluent.info_bg, fluent.info_fg, Icon::Info),
+        BannerKind::Warning => (fluent.warning_bg, fluent.warning_fg, Icon::Warning),
+        BannerKind::Error => (fluent.error_bg, fluent.error_fg, Icon::Error),
+    };
+    Frame::new()
+        .fill(background)
+        .corner_radius(4)
+        .inner_margin(Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                if theme::icons_ready() {
+                    ui.label(theme::icon_label(icon, foreground));
+                }
+                ui.label(RichText::new(text).color(foreground));
+            });
+        });
+}
+
+fn empty_sources(ui: &mut egui::Ui, add_files: &mut bool) {
+    let fluent = Fluent::from_visuals(ui.visuals());
+    ui.add_space(28.0);
+    ui.vertical_centered(|ui| {
+        ui.label(RichText::new("No sources yet").strong().size(16.0));
+        ui.label(RichText::new("Drop PDFs or images here.").color(fluent.text_secondary));
+        ui.add_space(8.0);
+        if theme::primary_button(ui, Icon::Add, "Add files").clicked() {
+            *add_files = true;
+        }
+    });
+}
+
+fn source_thumb(ui: &mut egui::Ui, slot: &Slot) {
+    let size = vec2(52.0, 52.0);
+    match &slot.thumb {
+        Thumb::Ready(texture) => {
+            ui.add(
+                Image::from_texture(texture)
+                    .fit_to_exact_size(size)
+                    .corner_radius(4)
+                    .bg_fill(Color32::WHITE),
+            );
+        }
+        Thumb::Pending => thumb_placeholder(ui, size, "…"),
+        Thumb::Unavailable => thumb_placeholder(ui, size, "—"),
+    }
+}
+
+fn thumb_placeholder(ui: &mut egui::Ui, size: Vec2, text: &str) {
+    let fluent = Fluent::from_visuals(ui.visuals());
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter().rect_filled(rect, 4.0, fluent.card);
+    ui.painter().rect_stroke(
+        rect,
+        4.0,
+        Stroke::new(1.0, fluent.stroke),
+        StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        text,
+        FontId::proportional(14.0),
+        fluent.text_secondary,
+    );
+}
+
+fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let fluent = Fluent::from_visuals(ui.visuals());
+    Frame::new()
+        .fill(fluent.card)
+        .stroke(Stroke::new(1.0, fluent.stroke))
+        .corner_radius(8)
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            add(ui);
+        });
+}
+
+fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let fluent = Fluent::from_visuals(ui.visuals());
+    Frame::new()
+        .fill(fluent.card)
+        .stroke(Stroke::new(1.0, fluent.stroke))
+        .corner_radius(8)
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(RichText::new(title).strong());
+            ui.add_space(8.0);
+            add(ui);
+        });
+    ui.add_space(8.0);
+}
+
+fn combo_row(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    selected: &str,
+    mut show: impl FnMut(&mut egui::Ui),
+) {
+    let fluent = Fluent::from_visuals(ui.visuals());
+    ui.label(RichText::new(label).color(fluent.text_secondary).size(12.0));
+    ComboBox::from_id_salt(id)
+        .selected_text(selected)
+        .width(ui.available_width())
+        .show_ui(ui, |ui| show(ui));
+}
+
+fn number_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+    speed: f64,
+) -> egui::Response {
+    ui.horizontal(|ui| {
+        ui.add_sized([96.0, 0.0], egui::Label::new(label));
+        ui.add(DragValue::new(value).range(range).speed(speed))
+    })
+    .inner
 }
 
 fn drag_points(ui: &mut egui::Ui, unit: DisplayUnit, label: &str, points: &mut f64) {
@@ -740,20 +956,22 @@ fn drag_points(ui: &mut egui::Ui, unit: DisplayUnit, label: &str, points: &mut f
         DisplayUnit::Millimetres => 2,
         DisplayUnit::Inches => 3,
     };
-    let response = ui.add(
-        DragValue::new(&mut display)
-            .speed(match unit {
-                DisplayUnit::Millimetres => 0.2,
-                DisplayUnit::Inches => 0.01,
-            })
-            .range(0.0..=unit.from_pt(72.0 * 40.0))
-            .max_decimals(decimals)
-            .suffix(unit.suffix())
-            .prefix(format!("{label} ")),
-    );
-    if response.changed() {
-        *points = unit.to_pt(display).max(0.0);
-    }
+    ui.horizontal(|ui| {
+        ui.add_sized([96.0, 0.0], egui::Label::new(label));
+        let response = ui.add(
+            DragValue::new(&mut display)
+                .speed(match unit {
+                    DisplayUnit::Millimetres => 0.2,
+                    DisplayUnit::Inches => 0.01,
+                })
+                .range(0.0..=unit.from_pt(72.0 * 40.0))
+                .max_decimals(decimals)
+                .suffix(unit.suffix()),
+        );
+        if response.changed() {
+            *points = unit.to_pt(display).max(0.0);
+        }
+    });
 }
 
 fn target_warning(
@@ -791,7 +1009,12 @@ fn pointer_hits_rect(pointer: Option<Pos2>, rect: Rect) -> bool {
 fn cursor_in_ui(ctx: &Context) -> Option<Pos2> {
     let mut point = POINT::default();
     unsafe { GetCursorPos(&mut point).ok()? };
-    let hwnd = unsafe { WindowFromPoint(POINT { x: point.x, y: point.y }) };
+    let hwnd = unsafe {
+        WindowFromPoint(POINT {
+            x: point.x,
+            y: point.y,
+        })
+    };
     if hwnd.is_invalid() {
         return None;
     }
@@ -829,18 +1052,30 @@ fn paint_sheet(
     slot_indices: &[usize],
 ) {
     let available = ui.available_size();
-    let scale = (available.x / spec.width_pt as f32)
-        .min(available.y / spec.height_pt as f32)
-        .max(0.01)
-        * 0.92;
+    let (area, _) = ui.allocate_exact_size(available, Sense::hover());
+    let pad = 28.0;
+    let fit = Vec2::new(
+        (area.width() - pad * 2.0).max(1.0),
+        (area.height() - pad * 2.0).max(1.0),
+    );
+    let scale = (fit.x / spec.width_pt as f32)
+        .min(fit.y / spec.height_pt as f32)
+        .max(0.01);
     let sheet_size = Vec2::new(spec.width_pt as f32 * scale, spec.height_pt as f32 * scale);
-    let (rect, _) = ui.allocate_exact_size(sheet_size, Sense::hover());
-    let painter = ui.painter_at(rect);
+    let rect = Rect::from_center_size(area.center(), sheet_size);
+    let painter = ui.painter_at(area);
+    let shadow = Shadow {
+        offset: [0, 8],
+        blur: 18,
+        spread: 0,
+        color: Color32::from_black_alpha(48),
+    };
+    painter.add(shadow.as_shape(rect, 2.0));
     painter.rect_filled(rect, 2.0, Color32::WHITE);
     painter.rect_stroke(
         rect,
         2.0,
-        Stroke::new(1.0, Color32::from_gray(80)),
+        Stroke::new(1.0, Color32::from_gray(180)),
         StrokeKind::Outside,
     );
 
