@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use egui::{
-    Align2, Color32, ColorImage, ComboBox, Context, DragValue, FontId, Frame, Id, Image, LayerId,
-    Margin, Order, Pos2, Rect, RichText, ScrollArea, Sense, Shadow, Stroke, StrokeKind,
-    TextureHandle, TextureOptions, Vec2, pos2, vec2,
+    Align2, Color32, ColorImage, ComboBox, Context, DragValue, FontId, Frame, Id, LayerId, Margin,
+    Order, Pos2, Rect, RichText, ScrollArea, Sense, Shadow, Stroke, StrokeKind, TextureHandle,
+    TextureOptions, Vec2, pos2, vec2,
 };
 
 use crate::theme::{self, Fluent, Icon};
@@ -30,6 +30,8 @@ struct Slot {
     height_pt: f64,
     /// How many times this source is placed, in order, before the next source.
     copies: u32,
+    /// Clockwise turns, in degrees: 0, 90, 180, or 270.
+    rotation: i64,
     use_target: bool,
     target_width_pt: f64,
     target_height_pt: f64,
@@ -46,7 +48,9 @@ impl Slot {
     }
 
     fn source_size(&self) -> SourceSize {
-        let mut size = SourceSize::page(self.width_pt, self.height_pt);
+        let (width, height) =
+            layout::visual_page_size(self.width_pt, self.height_pt, self.rotation);
+        let mut size = SourceSize::page(width, height);
         if let Some((width, height)) = self.target_points() {
             size = size.with_target(width, height);
         }
@@ -253,6 +257,7 @@ impl OpenImpApp {
                         width_pt: page.width_pt,
                         height_pt: page.height_pt,
                         copies: 1,
+                        rotation: 0,
                         use_target: false,
                         target_width_pt: 0.0,
                         target_height_pt: 0.0,
@@ -275,6 +280,7 @@ impl OpenImpApp {
                     width_pt: width as f64,
                     height_pt: height as f64,
                     copies: 1,
+                    rotation: 0,
                     use_target: false,
                     target_width_pt: 0.0,
                     target_height_pt: 0.0,
@@ -299,15 +305,17 @@ impl OpenImpApp {
         expand_instances(self.slots.iter().map(|slot| slot.copies))
     }
 
-    fn export_sources(&self) -> (Vec<SourceFile>, Vec<Option<(f64, f64)>>) {
+    fn export_sources(&self) -> (Vec<SourceFile>, Vec<Option<(f64, f64)>>, Vec<i64>) {
         let mut files = Vec::new();
         let mut targets = Vec::new();
+        let mut rotations = Vec::new();
         for index in self.instance_indices() {
             let slot = &self.slots[index];
             files.push(slot.source.clone());
             targets.push(slot.target_points());
+            rotations.push(slot.rotation);
         }
-        (files, targets)
+        (files, targets, rotations)
     }
 
     fn export_pdf(&mut self) {
@@ -318,8 +326,8 @@ impl OpenImpApp {
         else {
             return;
         };
-        let (files, targets) = self.export_sources();
-        match pdf_export::export_pdf(&files, &targets, &self.spec()) {
+        let (files, targets, rotations) = self.export_sources();
+        match pdf_export::export_pdf(&files, &targets, &rotations, &self.spec()) {
             Ok(bytes) => match std::fs::write(&path, bytes) {
                 Ok(()) => {
                     self.notice = Notice::Info(format!("Exported {}", path.display()));
@@ -339,8 +347,8 @@ impl OpenImpApp {
             );
             return;
         }
-        let (files, targets) = self.export_sources();
-        match pdf_export::export_pdf(&files, &targets, &self.spec()) {
+        let (files, targets, rotations) = self.export_sources();
+        match pdf_export::export_pdf(&files, &targets, &rotations, &self.spec()) {
             Ok(bytes) => match print_win::print_pdf(&bytes) {
                 Ok(PrintOutcome::Printed) => {
                     self.notice = Notice::Info("Sent the imposed sheets to the printer.".into());
@@ -598,6 +606,21 @@ impl OpenImpApp {
                             }
                             if theme::icon_button(ui, Icon::Delete, "Remove", true).clicked() {
                                 action = Some(ListAction::Remove(index));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [96.0, 0.0],
+                                egui::Label::new(
+                                    RichText::new("Rotation").color(fluent.text_secondary),
+                                ),
+                            );
+                            if ui
+                                .button(format!("{}°", slot.rotation))
+                                .on_hover_text("Turn this source clockwise.")
+                                .clicked()
+                            {
+                                slot.rotation = (slot.rotation + 90).rem_euclid(360);
                             }
                         });
                         let turned_on = ui.checkbox(&mut slot.use_target, "Target size").changed()
@@ -861,12 +884,9 @@ fn source_thumb(ui: &mut egui::Ui, slot: &Slot) {
     let size = vec2(52.0, 52.0);
     match &slot.thumb {
         Thumb::Ready(texture) => {
-            ui.add(
-                Image::from_texture(texture)
-                    .fit_to_exact_size(size)
-                    .corner_radius(4)
-                    .bg_fill(Color32::WHITE),
-            );
+            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+            ui.painter().rect_filled(rect, 4.0, Color32::WHITE);
+            paint_rotated_texture(&ui.painter_at(rect), texture.id(), rect, slot.rotation);
         }
         Thumb::Pending => thumb_placeholder(ui, size, "…"),
         Thumb::Unavailable => thumb_placeholder(ui, size, "—"),
@@ -1094,12 +1114,8 @@ fn paint_sheet(
         let clip_rect = pdf_rect_to_screen(rect, spec, placement.clip);
         match &slot.thumb {
             Thumb::Ready(texture) => {
-                painter.with_clip_rect(clip_rect).image(
-                    texture.id(),
-                    content_rect,
-                    Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                    Color32::WHITE,
-                );
+                let clipped = painter.with_clip_rect(clip_rect);
+                paint_rotated_texture(&clipped, texture.id(), content_rect, slot.rotation);
             }
             Thumb::Pending => {
                 painter.text(
@@ -1160,6 +1176,42 @@ fn paint_sheet(
         let b = pdf_point_to_screen(rect, spec, mark.x2, mark.y2);
         painter.line_segment([a, b], Stroke::new(1.0, Color32::BLACK));
     }
+}
+
+fn paint_rotated_texture(
+    painter: &egui::Painter,
+    texture: egui::TextureId,
+    rect: Rect,
+    rotation: i64,
+) {
+    let top_left = rect.left_top();
+    let top_right = rect.right_top();
+    let bottom_right = rect.right_bottom();
+    let bottom_left = rect.left_bottom();
+    // Positions follow the source image corners: top-left, top-right, bottom-right, bottom-left.
+    let positions = match rotation.rem_euclid(360) {
+        90 => [top_right, bottom_right, bottom_left, top_left],
+        180 => [bottom_right, bottom_left, top_left, top_right],
+        270 => [bottom_left, top_left, top_right, bottom_right],
+        _ => [top_left, top_right, bottom_right, bottom_left],
+    };
+    let uvs = [
+        pos2(0.0, 0.0),
+        pos2(1.0, 0.0),
+        pos2(1.0, 1.0),
+        pos2(0.0, 1.0),
+    ];
+    let mut mesh = egui::Mesh::with_texture(texture);
+    for (pos, uv) in positions.into_iter().zip(uvs) {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos,
+            uv,
+            color: Color32::WHITE,
+        });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 fn pdf_point_to_screen(sheet_rect: Rect, spec: &SheetSpec, x: f64, y: f64) -> Pos2 {

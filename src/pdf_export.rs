@@ -38,6 +38,7 @@ pub fn read_pdf_pages(path: &Path) -> Result<Vec<PageGeometry>, String> {
 pub fn export_pdf(
     sources: &[SourceFile],
     targets: &[Option<(f64, f64)>],
+    rotations: &[i64],
     spec: &SheetSpec,
 ) -> Result<Vec<u8>, String> {
     if sources.is_empty() {
@@ -53,6 +54,7 @@ pub fn export_pdf(
             Some((width, height)) => (Some(width), Some(height)),
             None => (None, None),
         };
+        let rotation = rotations.get(index).copied().unwrap_or(0);
         match source {
             SourceFile::Pdf { path, page_index } => {
                 if !pdf_pages.contains_key(path) {
@@ -62,15 +64,18 @@ pub fn export_pdf(
                     .get(path)
                     .and_then(|pages| pages.get(*page_index))
                     .ok_or_else(|| format!("{} has no page {}.", path.display(), page_index + 1))?;
+                let (width, height) =
+                    layout::visual_page_size(page.width_pt, page.height_pt, rotation);
                 sizes.push(SourceSize {
-                    width_pt: page.width_pt,
-                    height_pt: page.height_pt,
+                    width_pt: width,
+                    height_pt: height,
                     target_width_pt,
                     target_height_pt,
                 });
                 prepared.push(Prepared::Pdf {
                     path: path.clone(),
                     page_index: *page_index,
+                    rotation,
                 });
             }
             SourceFile::Image { path } => {
@@ -78,13 +83,18 @@ pub fn export_pdf(
                     encoded_images.insert(path.clone(), sources::encode_image_jpeg(path)?);
                 }
                 let (_, width, height) = encoded_images[path];
+                let (width, height) =
+                    layout::visual_page_size(width as f64, height as f64, rotation);
                 sizes.push(SourceSize {
-                    width_pt: width as f64,
-                    height_pt: height as f64,
+                    width_pt: width,
+                    height_pt: height,
                     target_width_pt,
                     target_height_pt,
                 });
-                prepared.push(Prepared::Image { path: path.clone() });
+                prepared.push(Prepared::Image {
+                    path: path.clone(),
+                    rotation,
+                });
             }
         }
     }
@@ -103,7 +113,7 @@ pub fn export_pdf(
                     pdfs.insert(path.clone(), import_pdf(path, &mut out)?);
                 }
             }
-            Prepared::Image { path } => {
+            Prepared::Image { path, .. } => {
                 if !image_objects.contains_key(path) {
                     let (jpeg, width, height) = encoded_images
                         .get(path)
@@ -148,8 +158,15 @@ pub fn export_pdf(
 }
 
 enum Prepared {
-    Pdf { path: PathBuf, page_index: usize },
-    Image { path: PathBuf },
+    Pdf {
+        path: PathBuf,
+        page_index: usize,
+        rotation: i64,
+    },
+    Image {
+        path: PathBuf,
+        rotation: i64,
+    },
 }
 
 struct ImportedPage {
@@ -354,7 +371,11 @@ fn build_sheet_page(
     for (index, placement) in sheet.placements.iter().enumerate() {
         let name = format!("P{index}");
         match &prepared[placement.source_index] {
-            Prepared::Pdf { path, page_index } => {
+            Prepared::Pdf {
+                path,
+                page_index,
+                rotation,
+            } => {
                 let page = pdfs
                     .get(path)
                     .and_then(|pages| pages.get(*page_index))
@@ -366,17 +387,17 @@ fn build_sheet_page(
                     placement,
                     page.width_pt,
                     page.height_pt,
-                    true,
+                    *rotation,
                 );
             }
-            Prepared::Image { .. } => {
+            Prepared::Image { rotation, .. } => {
                 let image_id = image_ids
                     .get(placement.source_index)
                     .copied()
                     .flatten()
                     .ok_or_else(|| "Missing an embedded image.".to_string())?;
                 xobjects.set(name.clone(), image_id);
-                push_placement(&mut operations, &name, placement, 1.0, 1.0, false);
+                push_placement(&mut operations, &name, placement, 1.0, 1.0, *rotation);
             }
         }
     }
@@ -417,24 +438,9 @@ fn push_placement(
     placement: &Placement,
     source_w: f64,
     source_h: f64,
-    scale_source: bool,
+    rotation: i64,
 ) {
-    let content = placement.content;
-    let (scale_x, scale_y) = if scale_source {
-        let scale_x = if source_w > 0.0 {
-            content.w / source_w
-        } else {
-            1.0
-        };
-        let scale_y = if source_h > 0.0 {
-            content.h / source_h
-        } else {
-            1.0
-        };
-        (scale_x, scale_y)
-    } else {
-        (content.w, content.h)
-    };
+    let matrix = layout::placement_matrix(placement.content, source_w, source_h, rotation);
 
     operations.push(Operation::new("q", vec![]));
     let clip = placement.clip;
@@ -451,14 +457,7 @@ fn push_placement(
     operations.push(Operation::new("n", vec![]));
     operations.push(Operation::new(
         "cm",
-        vec![
-            number(scale_x),
-            Object::Integer(0),
-            Object::Integer(0),
-            number(scale_y),
-            number(content.x),
-            number(content.y),
-        ],
+        matrix.into_iter().map(number).collect(),
     ));
     operations.push(Operation::new("Do", vec![Object::from(name)]));
     operations.push(Operation::new("Q", vec![]));
@@ -696,6 +695,7 @@ mod tests {
                 },
             ],
             &[],
+            &[],
             &letter_two_up(),
         )
         .unwrap();
@@ -783,10 +783,50 @@ mod tests {
             fit: FitMode::Contain,
             signature_pages: 0,
         };
-        let bytes = export_pdf(&[SourceFile::Image { path: path.clone() }], &[], &spec).unwrap();
+        let bytes =
+            export_pdf(&[SourceFile::Image { path: path.clone() }], &[], &[], &spec).unwrap();
         let _ = fs::remove_file(&path);
         let doc = Document::load_mem(&bytes).unwrap();
         assert_eq!(doc.get_pages().len(), 1);
+    }
+
+    #[test]
+    fn clockwise_image_rotation_turns_the_placement() {
+        let path = temp_path("wide.png");
+        let image = image::RgbImage::from_pixel(100, 50, image::Rgb([10, 10, 10]));
+        image.save(&path).unwrap();
+        let spec = SheetSpec {
+            width_pt: 400.0,
+            height_pt: 400.0,
+            columns: 1,
+            rows: 1,
+            margin_top: 0.0,
+            margin_right: 0.0,
+            margin_bottom: 0.0,
+            margin_left: 0.0,
+            gutter_x: 0.0,
+            gutter_y: 0.0,
+            bleed_top: 0.0,
+            bleed_right: 0.0,
+            bleed_bottom: 0.0,
+            bleed_left: 0.0,
+            crop_marks: false,
+            fit: FitMode::Contain,
+            signature_pages: 0,
+        };
+        let bytes = export_pdf(
+            &[SourceFile::Image { path: path.clone() }],
+            &[],
+            &[90],
+            &spec,
+        )
+        .unwrap();
+        let _ = fs::remove_file(&path);
+        let doc = Document::load_mem(&bytes).unwrap();
+        let pages = doc.get_pages();
+        let content = doc.get_page_content(pages[&1]);
+        let text = String::from_utf8_lossy(&content);
+        assert!(text.contains("0 -400 200 0 100 400 cm"), "{text}");
     }
 
     #[test]
@@ -816,7 +856,8 @@ mod tests {
             fit: FitMode::Fill,
             signature_pages: 0,
         };
-        let bytes = export_pdf(&[SourceFile::Image { path: path.clone() }], &[], &spec).unwrap();
+        let bytes =
+            export_pdf(&[SourceFile::Image { path: path.clone() }], &[], &[], &spec).unwrap();
         let _ = fs::remove_file(&path);
         let pdf_path = temp_path("red.pdf");
         fs::write(&pdf_path, &bytes).unwrap();

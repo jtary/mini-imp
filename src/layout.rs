@@ -233,6 +233,36 @@ pub fn upright_matrix(
     (matrix, eff_w, eff_h)
 }
 
+/// Maps a source box `(0, 0)`–`(source_w, source_h)` into `dest`, turning it
+/// clockwise by `rotate_deg` (the same direction as PDF `/Rotate`).
+pub fn placement_matrix(dest: Rect, source_w: f64, source_h: f64, rotate_deg: i64) -> [f64; 6] {
+    let (vis_w, vis_h) = visual_page_size(source_w, source_h, rotate_deg);
+    let sx = if vis_w.abs() > 1e-9 {
+        dest.w / vis_w
+    } else {
+        1.0
+    };
+    let sy = if vis_h.abs() > 1e-9 {
+        dest.h / vis_h
+    } else {
+        1.0
+    };
+    let (a, b, c, d, e, f) = match rotate_deg.rem_euclid(360) {
+        90 => (0.0, -sy, sx, 0.0, dest.x, dest.y + sy * source_w),
+        180 => (
+            -sx,
+            0.0,
+            0.0,
+            -sy,
+            dest.x + sx * source_w,
+            dest.y + sy * source_h,
+        ),
+        270 => (0.0, sy, -sx, 0.0, dest.x + sx * source_h, dest.y),
+        _ => (sx, 0.0, 0.0, sy, dest.x, dest.y),
+    };
+    [a, b, c, d, e, f]
+}
+
 /// True when a margin or gutter is too small for the bleed and crop marks.
 ///
 /// With no sources, this uses the grid cell. With sources, each target trim is
@@ -753,6 +783,57 @@ mod tests {
         assert_eq!(visual_page_size(200.0, 400.0, 180), (200.0, 400.0));
         assert_eq!(visual_page_size(200.0, 400.0, 270), (400.0, 200.0));
         assert_eq!(visual_page_size(200.0, 400.0, -90), (400.0, 200.0));
+    }
+
+    #[test]
+    fn clockwise_placement_keeps_the_artwork_inside_the_destination() {
+        let source_w = 200.0;
+        let source_h = 400.0;
+        let corners = [
+            (0.0, 0.0),
+            (source_w, 0.0),
+            (0.0, source_h),
+            (source_w, source_h),
+        ];
+        for rotation in [0, 90, 180, 270] {
+            let (width, height) = visual_page_size(source_w, source_h, rotation);
+            let dest = Rect {
+                x: 10.0,
+                y: 20.0,
+                w: width,
+                h: height,
+            };
+            let matrix = placement_matrix(dest, source_w, source_h, rotation);
+            let mapped: Vec<(f64, f64)> = corners
+                .into_iter()
+                .map(|(x, y)| {
+                    (
+                        matrix[0] * x + matrix[2] * y + matrix[4],
+                        matrix[1] * x + matrix[3] * y + matrix[5],
+                    )
+                })
+                .collect();
+            let min_x = mapped
+                .iter()
+                .map(|point| point.0)
+                .fold(f64::INFINITY, f64::min);
+            let max_x = mapped
+                .iter()
+                .map(|point| point.0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_y = mapped
+                .iter()
+                .map(|point| point.1)
+                .fold(f64::INFINITY, f64::min);
+            let max_y = mapped
+                .iter()
+                .map(|point| point.1)
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert_close(min_x, dest.x);
+            assert_close(min_y, dest.y);
+            assert_close(max_x, dest.x + dest.w);
+            assert_close(max_y, dest.y + dest.h);
+        }
     }
 
     #[test]
