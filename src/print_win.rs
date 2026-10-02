@@ -128,7 +128,7 @@ fn print_on_dc(
         let dest_x = (avail_w - dest_w) / 2;
         let dest_y = (avail_h - dest_h) / 2;
 
-        let doc_name = w!("OpenImp");
+        let doc_name = w!("Mini Imp");
         let info = DocInfoW {
             cb_size: std::mem::size_of::<DocInfoW>() as i32,
             lpsz_doc_name: doc_name.0,

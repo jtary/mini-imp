@@ -1,4 +1,4 @@
-//! OpenImp window: source list, sheet settings, and preview.
+//! Mini Imp window: source list, sheet settings, and preview.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -343,7 +343,7 @@ impl OpenImpApp {
     fn print(&mut self) {
         if !matches!(self.pdfium, PdfiumState::Ready) {
             self.notice = Notice::Error(
-                "Place pdfium.dll next to OpenImp.exe to print. Export PDF still works.".into(),
+                "Place pdfium.dll next to Mini Imp to print. Export PDF still works.".into(),
             );
             return;
         }
@@ -489,7 +489,7 @@ impl OpenImpApp {
                         has_sources && matches!(self.pdfium, PdfiumState::Ready),
                     )
                     .on_disabled_hover_text(match self.pdfium {
-                        PdfiumState::Missing => "Place pdfium.dll next to OpenImp.exe to print.",
+                        PdfiumState::Missing => "Place pdfium.dll next to Mini Imp to print.",
                         PdfiumState::Checking => "Checking for pdfium.dll…",
                         PdfiumState::Ready => "Add a PDF or an image first.",
                     });

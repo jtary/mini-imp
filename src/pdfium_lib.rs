@@ -25,7 +25,7 @@ pub fn open() -> Result<Pdfium, String> {
         Ok(bindings) => Ok(Pdfium::new(bindings)),
         Err(PdfiumError::PdfiumLibraryBindingsAlreadyInitialized) => Ok(Pdfium::default()),
         Err(error) => Err(format!(
-            "{error}. Place a 64-bit pdfium.dll next to OpenImp.exe. PDF export still works without it; page previews and printing need it."
+            "{error}. Place a 64-bit pdfium.dll next to Mini Imp. PDF export still works without it; page previews and printing need it."
         )),
     }
 }
@@ -62,7 +62,7 @@ pub fn render_document_page(
     let height = bitmap.height().max(0) as u32;
     let rgba = bitmap.as_rgba_bytes();
     if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
-        return Err("Pdfium returned a bitmap OpenImp could not use.".into());
+        return Err("Pdfium returned a bitmap Mini Imp could not use.".into());
     }
     Ok((width, height, rgba))
 }

@@ -1,5 +1,5 @@
 [package]
-name = "openimp"
+name = "mini-imp"
 version = "0.1.0"
 edition = "2024"
 description = "N-up imposition of PDFs and images for Windows printing"
